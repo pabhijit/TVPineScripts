@@ -1,0 +1,169 @@
+//@version=6
+strategy("AI-Swing Strategy (EMA10/20 + MACD + CCI + DI) — Profiles & Auto-Tune", overlay=true, calc_on_every_tick=false, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.1, slippage=3)
+
+//=========================
+// Inputs: Profiles & Dates
+//=========================
+marketProfile = input.string("Custom", "Market Profile", options=["BTC","ETH","Custom"])
+autoTune = input.bool(false, "Auto-Tune (experimental)")
+startDate = input.time(defval=1514764800000, title="Start Date (2018-01-01 00:00 UTC)")
+endDate = input.time(defval=3155759940000, title="End Date (2069-12-31 23:59 UTC)")
+
+//=========================
+// Inputs: Core Parameters
+//=========================
+fastEMALen = input.int(10, "Fast EMA", minval=1)
+slowEMALen = input.int(20, "Slow EMA", minval=1)
+macdFast = input.int(12, "MACD Fast")
+macdSlow = input.int(26, "MACD Slow")
+macdSignal = input.int(9, "MACD Signal")
+cciLen = input.int(20, "CCI Length")
+cciThreshold = input.float(0.0, "CCI Threshold") // tuned down from 100 based on tests
+stopMult = input.float(1.2, "ATR Stop Multiplier")
+rewardMult = input.float(1.5, "Reward Multiplier")
+
+// Trend filters
+adxLen = input.int(14, "ADX Length")
+adxThreshold = input.float(18.0, "ADX Threshold")
+emaDiffPctTh = input.float(0.1, "EMA Gap Threshold (%)")
+trendMode = input.string("OR", "Trend Filter Mode (ADX vs EMA Gap)", options=["OR","AND"])
+
+// DI / DMI
+diLen = input.int(8, "DI Length")
+useDI = input.bool(true, "Use DI filter?")
+useDICross = input.bool(true, "Require recent +DI/−DI crossover?")
+diValidBars = input.int(8, "DI crossover valid for N bars", minval=1)
+diSeparation = input.float(0.0, "Min DI separation |+DI−−DI|", minval=0.0)
+
+//====================================
+// Lightweight Auto-Tune / Profiles
+//====================================
+// If Auto-Tune is ON and profile is not Custom, we’ll decide between BTC/ETH presets using a simple recent ATR% heuristic.
+atrForAuto = ta.atr(14)
+atrPct = atrForAuto / nz(close, 1) * 100.0
+recentATRpct = ta.sma(atrPct, 50)
+useBTC = autoTune ? recentATRpct < 2.0 : (marketProfile == "BTC")
+useETH = autoTune ? recentATRpct >= 2.0 : (marketProfile == "ETH")
+useCustom = marketProfile == "Custom"
+
+// Apply BTC/ETH presets when selected (you can still switch to Custom to edit freely)
+if useBTC
+    // BTC profile from sweep: DI=10, window=10, RR≈2.0, ADX 20, EMA gap 0.1, CCI ≤ 25 works fine
+    diLen := 10
+    diValidBars := 10
+    diSeparation := 0.0
+    adxThreshold := 20.0
+    emaDiffPctTh := 0.1
+    trendMode := "OR"
+    cciThreshold := 0.0
+    stopMult := 1.2
+    rewardMult := 2.0
+if useETH
+    // ETH profile from sweep: DI=8, window=8, RR≈1.5, ADX 18, EMA gap 0.1, CCI ≤ 50
+    diLen := 8
+    diValidBars := 8
+    diSeparation := 0.0
+    adxThreshold := 18.0
+    emaDiffPctTh := 0.1
+    trendMode := "OR"
+    cciThreshold := 0.0
+    stopMult := 1.2
+    rewardMult := 1.5
+
+//=========================
+// Indicators
+//=========================
+emaFast = ta.ema(close, fastEMALen)
+emaSlow = ta.ema(close, slowEMALen)
+[macdLine, signalLine, hist] = ta.macd(close, macdFast, macdSlow, macdSignal)
+cci = ta.cci(close, cciLen)
+atr14 = ta.atr(14)
+
+// Manual DMI/ADX (Wilder) — version-proof
+up = ta.change(high)
+dn = -ta.change(low)
+plusDM = (up > dn and up > 0) ? up : 0.0
+minusDM = (dn > up and dn > 0) ? dn : 0.0
+tr1 = high - low
+tr2 = math.abs(high - close[1])
+tr3 = math.abs(low - close[1])
+trueRange = math.max(tr1, math.max(tr2, tr3))
+trRma = ta.rma(trueRange, diLen)
+plusDMRma = ta.rma(plusDM, diLen)
+minusDMRma = ta.rma(minusDM, diLen)
+plusDI = 100.0 * plusDMRma / (trRma == 0 ? 1 : trRma)
+minusDI = 100.0 * minusDMRma / (trRma == 0 ? 1 : trRma)
+dxDen = plusDI + minusDI
+dx = 100.0 * math.abs(plusDI - minusDI) / (dxDen == 0 ? 1 : dxDen)
+adxVal = ta.rma(dx, adxLen)
+
+//=========================
+// Regime / Momentum
+//=========================
+emaDiffPct = math.abs(emaFast - emaSlow) / nz(emaSlow, 1) * 100.0
+isTrendingOR = (adxVal > adxThreshold) or (emaDiffPct > emaDiffPctTh)
+isTrendingAND = (adxVal > adxThreshold) and (emaDiffPct > emaDiffPctTh)
+isTrending = trendMode == "AND" ? isTrendingAND : isTrendingOR
+bullTrend = emaFast > emaSlow
+priceAbove = close > emaFast and close > emaSlow
+macdBull = macdLine > signalLine and hist > 0
+
+// DI logic
+diCrossUp = ta.crossover(plusDI, minusDI)
+diCrossDn = ta.crossover(minusDI, plusDI)
+diUpRecent = ta.barssince(diCrossUp) <= diValidBars
+diDownRecent = ta.barssince(diCrossDn) <= diValidBars
+diSepOK = math.abs(plusDI - minusDI) > diSeparation
+diLongOK = useDI ? (useDICross ? (diUpRecent and plusDI > minusDI and diSepOK) : (plusDI > minusDI and diSepOK)) : true
+
+//=========================
+// Time window
+//=========================
+inDateRange = time >= startDate and time <= endDate
+
+//=========================
+// Entries & Exits (Long-only)
+//=========================
+longCond = inDateRange and isTrending and bullTrend and priceAbove and macdBull and cci > cciThreshold and diLongOK
+buySignal = longCond and strategy.position_size == 0
+
+longStop = close - atr14 * stopMult
+longTP = close + atr14 * stopMult * rewardMult
+
+// Exit options: keep it simple; ATR SL/TP + trend/DI fail-safe
+closeLongCond = inDateRange and strategy.position_size > 0 and (diDownRecent or not isTrending)
+
+//=========================
+// Orders
+//=========================
+if buySignal
+    strategy.entry("Long", strategy.long)
+    strategy.exit("XL-ATR", from_entry="Long", stop=longStop, limit=longTP)
+if closeLongCond
+    strategy.close("Long")
+
+//=========================
+// Visuals
+//=========================
+plot(emaFast, title="10 EMA", color=color.orange, offset=0)
+plot(emaSlow, title="20 EMA", color=color.purple, offset=0)
+plot(plusDI, "DI+", color=color.new(color.teal, 30), display=display.none, offset=0)
+plot(minusDI, "DI-", color=color.new(color.red, 30), display=display.none, offset=0)
+plot(adxVal, "ADX", color=color.new(color.orange, 30), display=display.none, offset=0)
+plotshape(buySignal, title="BUY", location=location.belowbar, color=color.green, style=shape.labelup, text="BUY", size=size.tiny, offset=0)
+plotshape(closeLongCond, title="CLOSE LONG", location=location.abovebar, color=color.red, style=shape.labeldown, text="EXIT", size=size.tiny, offset=0)
+
+//=========================
+// Alerts
+//=========================
+alertcondition(buySignal, title="Buy Alert", message="BUY signal on {{ticker}}")
+alertcondition(closeLongCond, title="Close Long Alert", message="CLOSE LONG on {{ticker}}")
+
+//=========================
+// Notes — Strategy & Cross-Asset Takeaways
+//=========================
+// Strategy: Trend-following swing entries with EMA(10/20) alignment, MACD momentum (line>signal & hist>0), CCI confirmation (default 0 so we don’t miss continuations), and DI filter (+DI over −DI with a recent crossover window). Exits use ATR SL/TP plus a trend/DI fail-safe.
+// ETH (4H): Preferred DI=8, DI window=8, TrendMode=OR, ADX≈18, EMA gap≈0.1, RR≈1.5. Tight stops and modest targets improved PF and trade frequency.
+// BTC (4H): Preferred DI=10, DI window=10, TrendMode=OR, ADX≈20, EMA gap≈0.1, RR≈2.0. Slightly slower DI and larger TP worked better.
+// Generalization: Use TrendMode=OR to stay active when ADX dips but EMA spread remains. Keep CCI threshold ≤50 for continuations. Start with DI=8–10 and DI window=8–10 for crypto majors; slower equities often prefer DI=10–14.
+// Auto-Tune: This switch picks BTC vs ETH presets via a simple recent ATR% heuristic. For precise results, set Market Profile manually or “Custom” and adjust inputs. 
