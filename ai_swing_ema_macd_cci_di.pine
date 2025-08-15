@@ -1,5 +1,5 @@
 //@version=6
-strategy("AI-Swing Strategy (EMA10/20 + MACD + CCI + DI) — BTC Defaults (Editable)", overlay=true, calc_on_every_tick=false, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.1, slippage=3)
+strategy("AI-Swing Strategy (EMA10/20 + MACD + CCI + DI)", overlay=true, calc_on_every_tick=false, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.1, slippage=3)
 
 //=== Date Range (const ints) ===
 startDate = input.time(defval=1514764800000, title="Start Date (2018-01-01 00:00 UTC)")
