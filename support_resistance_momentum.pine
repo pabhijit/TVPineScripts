@@ -1,0 +1,272 @@
+//@version=6
+indicator("Auto SR v6 • Strict • Touches • Commentary", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=400)
+
+//==================== Inputs ====================
+lookbackBars    = input.int(500, "Lookback (bars)", minval=100, tooltip="Levels use only the most recent N bars")
+pivotLeft       = input.int(5,  "Pivot Left",  minval=1, maxval=30)
+pivotRight      = input.int(5,  "Pivot Right", minval=1, maxval=30)
+atrLen          = input.int(14, "ATR Length", minval=5, maxval=200)
+clusterATR      = input.float(0.25, "Cluster width (× ATR)", step=0.05, tooltip="How close two pivots must be (in ATR) to merge")
+zoneHalfATR     = input.float(0.20, "Zone half-width (× ATR)", step=0.05)
+levelsPerSide   = input.int(3, "Levels per side", minval=1, maxval=10)
+
+showLines       = input.bool(true,  "Draw center lines")
+showZones       = input.bool(true,  "Draw filled zones")
+showLabels      = input.bool(true,  "Show price labels")
+showTable       = input.bool(true,  "Show levels table (top-right)")
+showCommentary  = input.bool(true,  "Show commentary / trade idea")
+
+//==================== Core series ====================
+atr  = ta.atr(atrLen)
+inWindow = bar_index > nz(bar_index[lookbackBars], 0)
+
+// raw pivots
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+pl = ta.pivotlow(low,  pivotLeft, pivotRight)
+
+// clustered level store
+var float[] lvl = array.new_float()
+var int[]   tch = array.new_int()
+
+// merge helper (guards size and tolerance)
+mergeLevel(price) =>
+    n = array.size(lvl)
+    if n == 0
+        array.push(lvl, price)
+        array.push(tch, 1)
+    else
+        tol = clusterATR * atr
+        var int found = na
+        for i = 0 to n - 1
+            li = array.get(lvl, i)
+            if not na(li) and math.abs(li - price) <= tol
+                found := i
+                break
+        if na(found)
+            array.push(lvl, price)
+            array.push(tch, 1)
+        else
+            // weighted mean by touches; bump touch count
+            oldTouches = array.get(tch, found)
+            newVal = (array.get(lvl, found) * oldTouches + price) / (oldTouches + 1)
+            array.set(lvl, found, newVal)
+            array.set(tch, found, oldTouches + 1)
+
+// build clusters strictly in lookback window
+if inWindow
+    if not na(ph)
+        mergeLevel(ph)
+    if not na(pl)
+        mergeLevel(pl)
+
+//---------------- Selection (strict side, sorted, dedup) ----------------
+existsClose(float[] arr, float v, float tol) =>
+    present = false
+    sz = array.size(arr)
+    if sz > 0
+        for i = 0 to sz - 1
+            if math.abs(array.get(arr, i) - v) <= tol
+                present := true
+                break
+    present
+
+collectAbove(n) =>
+    float[] out = array.new_float()
+    tol   = math.max(syminfo.mintick, atr * 0.01)
+    szAll = array.size(lvl)
+    if szAll == 0
+        out
+    else
+        float[] pool = array.new_float()
+        for i = 0 to szAll - 1
+            p = array.get(lvl, i)
+            if not na(p) and p > close
+                array.push(pool, p)
+        szPool = array.size(pool)
+        if szPool == 0
+            out
+        else
+            if szPool > 1
+                array.sort(pool, order.ascending)
+            for i = 0 to szPool - 1
+                v = array.get(pool, i)
+                if not existsClose(out, v, tol)
+                    array.push(out, v)
+                    if array.size(out) >= n
+                        break
+            out
+
+collectBelow(n) =>
+    float[] out = array.new_float()
+    tol   = math.max(syminfo.mintick, atr * 0.01)
+    szAll = array.size(lvl)
+    if szAll == 0
+        out
+    else
+        float[] pool = array.new_float()
+        for i = 0 to szAll - 1
+            p = array.get(lvl, i)
+            if not na(p) and p < close
+                array.push(pool, p)
+        szPool = array.size(pool)
+        if szPool == 0
+            out
+        else
+            if szPool > 1
+                array.sort(pool, order.ascending)
+            // iterate from end so nearest-below (largest) first
+            for k = 0 to szPool - 1
+                idx = szPool - 1 - k
+                v = array.get(pool, idx)
+                if not existsClose(out, v, tol)
+                    array.push(out, v)
+                    if array.size(out) >= n
+                        break
+            out
+
+
+resLevels = collectAbove(levelsPerSide)
+supLevels = collectBelow(levelsPerSide)
+
+// map selected level -> touches (by nearest cluster)
+getTouches(val) =>
+    cnt = 0
+    tol = math.max(syminfo.mintick, atr * 0.01)
+    float best = na
+    int bestIdx = na
+    sz = array.size(lvl)
+    if sz > 0
+        for i = 0 to sz - 1
+            li = array.get(lvl, i)
+            if not na(li)
+                d = math.abs(li - val)
+                if na(best) or d < best
+                    best := d
+                    bestIdx := i
+    if not na(bestIdx) and best <= tol
+        cnt := array.get(tch, bestIdx)
+    cnt
+
+//---------------- Draw on chart (last bar) ----------------
+var line[] lines = array.new_line()
+var box[]  boxes = array.new_box()
+var label[] labs = array.new_label()
+
+deleteAll() =>
+    while array.size(lines) > 0
+        line.delete(array.pop(lines))
+    while array.size(boxes) > 0
+        box.delete(array.pop(boxes))
+    while array.size(labs) > 0
+        label.delete(array.pop(labs))
+
+drawLevel(price, isRes) =>
+    zoneHalf = zoneHalfATR * atr
+    col  = isRes ? color.new(color.red, 0)  : color.new(color.lime, 0)
+    zcol = isRes ? color.new(color.red, 85) : color.new(color.lime, 85)
+    if showZones
+        b = box.new(left=bar_index - lookbackBars, top=price + zoneHalf, right=bar_index + 500, bottom=price - zoneHalf, border_color=color.new(col, 0), bgcolor=zcol, extend=extend.right, xloc=xloc.bar_index)
+        array.push(boxes, b)
+    if showLines
+        ln = line.new(x1=bar_index - lookbackBars, y1=price, x2=bar_index + 500, y2=price, xloc=xloc.bar_index, extend=extend.right, color=col, width=2)
+        array.push(lines, ln)
+    if showLabels and barstate.islast
+        lb = label.new(x=bar_index, y=price, text=str.tostring(price, format.mintick), style=label.style_label_right, color=color.new(color.black, 0), textcolor=color.white)
+        array.push(labs, lb)
+
+if barstate.islast
+    deleteAll()
+    for i = 0 to array.size(resLevels) - 1
+        drawLevel(array.get(resLevels, i), true)
+    for i = 0 to array.size(supLevels) - 1
+        drawLevel(array.get(supLevels, i), false)
+
+//---------------- Levels Table (with Touches) ----------------
+var table t = na
+COLS = 5
+ROWS = levelsPerSide*2 + 6
+toPrice(x) => na(x) ? "" : str.tostring(x, format.mintick)
+toDiff(d)  => na(d) ? "" : str.tostring(d, format.mintick)
+toPct(d)   => na(d) or na(close) ? "" : str.tostring(d/close*100, "#.##") + "%"
+
+clearTable() =>
+    for r = 0 to ROWS - 1
+        for c = 0 to COLS - 1
+            table.cell(t, c, r, "", bgcolor=color.new(color.black, 85))
+
+writeHeader() =>
+    table.cell(t, 0, 0, "Side",    text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 1, 0, "Level",   text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 2, 0, "Δ$",      text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 3, 0, "Δ%",      text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(t, 4, 0, "Touches", text_color=color.white, bgcolor=color.new(color.black, 0))
+
+if showTable and barstate.islast
+    if na(t)
+        t := table.new(position.top_right, COLS, ROWS, border_width=1)
+    clearTable()
+    writeHeader()
+    row = 1
+    // Resistances (above)
+    rc = array.size(resLevels)
+    if rc > 0
+        maxR = math.min(levelsPerSide, rc)
+        for i = 0 to maxR - 1
+            p = array.get(resLevels, i)
+            d = p - close
+            tc = getTouches(p)
+            table.cell(t, 0, row, "R"+str.tostring(i+1), bgcolor=color.new(color.red, 85), text_color=color.white)
+            table.cell(t, 1, row, toPrice(p))
+            table.cell(t, 2, row, toDiff(d))
+            table.cell(t, 3, row, toPct(d))
+            table.cell(t, 4, row, str.tostring(tc))
+            row += 1
+    // Supports (below)
+    sc = array.size(supLevels)
+    if sc > 0
+        maxS = math.min(levelsPerSide, sc)
+        for i = 0 to maxS - 1
+            p = array.get(supLevels, i)
+            d = close - p
+            tc = getTouches(p)
+            table.cell(t, 0, row, "S"+str.tostring(i+1), bgcolor=color.new(color.lime, 85), text_color=color.white)
+            table.cell(t, 1, row, toPrice(p))
+            table.cell(t, 2, row, toDiff(d))
+            table.cell(t, 3, row, toPct(d))
+            table.cell(t, 4, row, str.tostring(tc))
+            row += 1
+
+//---------------- Commentary / Trade Idea ----------------
+var label note = na
+if showCommentary and barstate.islast
+    if not na(note)
+        label.delete(note)
+    // nearest three for quick sanity check
+    r1 = array.size(resLevels) > 0 ? array.get(resLevels, 0) : na
+    r2 = array.size(resLevels) > 1 ? array.get(resLevels, 1) : na
+    r3 = array.size(resLevels) > 2 ? array.get(resLevels, 2) : na
+    s1 = array.size(supLevels) > 0 ? array.get(supLevels, 0) : na
+    s2 = array.size(supLevels) > 1 ? array.get(supLevels, 1) : na
+    s3 = array.size(supLevels) > 2 ? array.get(supLevels, 2) : na
+
+    txt = syminfo.ticker + " @ " + toPrice(close) + "\n"
+    if not na(r1)
+        txt += "Above " + toPrice(r1) + " → " + (na(r2) ? "room higher" : "targets " + toPrice(r2)) + "\n"
+    if not na(s1)
+        txt += "Below " + toPrice(s1) + " → " + (na(s2) ? "risk lower" : "down to " + toPrice(s2)) + "\n"
+    // list top-3 for quick visual cross-check
+    txt += "\nTop-3 R: " + (na(r1) ? "-" : toPrice(r1)) + ", " + (na(r2) ? "-" : toPrice(r2)) + ", " + (na(r3) ? "-" : toPrice(r3))
+    txt += "\nTop-3 S: " + (na(s1) ? "-" : toPrice(s1)) + ", " + (na(s2) ? "-" : toPrice(s2)) + ", " + (na(s3) ? "-" : toPrice(s3))
+
+    // trade idea (guarded)
+    idea = ""
+    if not na(r1) and r1 > close
+        idea := "Idea: Calls on breakout > " + toPrice(r1)
+    if not na(s1) and s1 < close
+        idea := (idea == "" ? "" : idea + " | ") + "Puts on breakdown < " + toPrice(s1)
+    if idea == ""
+        idea := "Idea: Neutral / wait"
+
+    txt += "\n\n" + idea
+    note := label.new(bar_index, high, txt, style=label.style_label_left, textcolor=color.white, color=color.new(color.black, 0))
