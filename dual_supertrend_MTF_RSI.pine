@@ -1,0 +1,277 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © pabhijit
+
+//@version=6
+strategy("Dual Supertrend + MTF RSI",
+     overlay=true, calc_on_every_tick=false, process_orders_on_close=true,
+     commission_type=strategy.commission.percent, commission_value=0.1, slippage=3,
+     initial_capital=100000, pyramiding=0,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100)
+
+//======================== Inputs ========================
+groupRSI  = "RSI / Regime"
+rsiLen    = input.int(14, "RSI Length", 5, 100, group=groupRSI)
+rsiHTF    = input.timeframe("D", "Higher Timeframe (for RSI)", group=groupRSI)
+bullTh    = input.float(50, "Daily RSI Bull Threshold", 40, 60, step=0.1, group=groupRSI)
+bearTh    = input.float(50, "Daily RSI Bear Threshold", 40, 60, step=0.1, group=groupRSI)
+rsiStrong = input.int(60, "Strong Up (LTF RSI >)", 50, 90, group=groupRSI)
+rsiWeak   = input.int(40, "Strong Down (LTF RSI <)", 10, 50, group=groupRSI)
+
+groupST   = "Dual Supertrend"
+stS_Atr   = input.int(7,  "Short ST ATR Length", 1, 100, group=groupST)
+stS_Mult  = input.float(3.0, "Short ST Multiplier", 1.0, 10.0, step=0.1, group=groupST)
+stL_Atr   = input.int(14, "Long ST ATR Length", 1, 100, group=groupST)
+stL_Mult  = input.float(3.5, "Long ST Multiplier", 1.0, 10.0, step=0.1, group=groupST)
+invertST  = input.bool(false, "Invert Supertrend Direction (use if colors look flipped)", group=groupST)
+
+groupEntry = "Entry Gating (first pullback)"
+useWindow    = input.bool(true,  "Only after fresh Short ST flip?", group=groupEntry)
+entryWindow  = input.int(12,     "Bars after Short ST flip", 1, 50, group=groupEntry)
+requireTouch = input.bool(false, "Require pullback touching Short ST line", group=groupEntry)
+
+groupExit = "Risk / Exits"
+useSTExit   = input.bool(true, "Close when Trend turns down (source below)", group=groupExit)
+trailWithST = input.bool(true, "Use Long ST as protective stop", group=groupExit)
+
+groupTargets = "Partial Targets"
+useTargets   = input.bool(true,  "Enable 1R & 2R profit targets", group=groupTargets)
+riskFrom     = input.string("Long ST", "Stop reference", options=["Long ST","ATR x Mult"], group=groupTargets)
+atrLenStop   = input.int(14, "ATR length (if ATR stop)", 2, 200, group=groupTargets)
+atrMultStop  = input.float(2.0, "ATR Mult (if ATR stop)", 0.5, 6.0, step=0.1, group=groupTargets)
+take1R       = input.float(1.0, "Target 1 (R)", 0.5, 3.0, step=0.25, group=groupTargets)
+take2R       = input.float(2.0, "Target 2 (R)", 1.0, 6.0, step=0.5, group=groupTargets)
+tgtQty1      = input.int(50,  "Close % at 1R", 1, 99, group=groupTargets)
+
+groupDash = "Dashboard / Stats"
+showDash  = input.bool(true, "Show right-side dashboard", group=groupDash)
+trendSource = input.string("Long Supertrend", "Dashboard Trend Source",
+     options=["Long Supertrend","Short Supertrend","Price > EMA"], group=groupDash)
+emaLen    = input.int(20, "Baseline EMA", 5, 200, group=groupDash)
+adrLen    = input.int(14, "ADR Lookback", 2, 100, group=groupDash)
+atrLen    = input.int(14, "ATR Lookback", 2, 100, group=groupDash)
+extMult   = input.float(1.0, "Extended if |Dist from EMA| > (ADR% × this)", 0.1, 3.0, step=0.1, group=groupDash)
+benchSym  = input.symbol("SPY", "Relative Strength Benchmark", group=groupDash)
+rsLen     = input.int(50, "RS lookback (bars)", 10, 200, group=groupDash)
+
+groupDots = "Smart-Money Dots"
+showDots  = input.bool(true, "Show smart-money dots", group=groupDots)
+volLen    = input.int(20, "Volume SMA", 5, 200, group=groupDots)
+volMult   = input.float(1.5, "Volume Surge ×", 1.0, 5.0, step=0.1, group=groupDots)
+wrbMult   = input.float(1.2, "Wide-Range vs ATR ×", 0.5, 3.0, step=0.1, group=groupDots)
+closeBias = input.float(0.70, "Close in top/bottom X of bar", 0.5, 0.95, step=0.05, group=groupDots)
+
+groupViz  = "Supertrend Visuals"
+useCloud  = input.bool(true,  "Show ST as cloud (off = split lines)", group=groupViz)
+cloudATRK = input.float(0.6,  "Cloud offset = ATR × k", 0.1, 3.0, step=0.1, group=groupViz)
+showBorder= input.bool(true,  "Draw inner border line", group=groupViz)
+
+allowShorts = input.bool(false, "Allow Shorts (symmetrical rules)")
+
+//======================== Core Signals ===================
+rsiLTF  = ta.rsi(close, rsiLen)
+rsiHTFv = request.security(syminfo.tickerid, rsiHTF, ta.rsi(close, rsiLen), barmerge.gaps_off, barmerge.lookahead_off)
+bullHTF = rsiHTFv > bullTh
+bearHTF = rsiHTFv < bearTh
+
+// Built-in Supertrends
+[stS_line, dirShort] = ta.supertrend(stS_Mult, stS_Atr) //  1 up, -1 down
+[stL_line, dirLong ] = ta.supertrend(stL_Mult, stL_Atr)
+
+dirShortEff = invertST ? -dirShort : dirShort
+dirLongEff  = invertST ? -dirLong  : dirLong
+
+// --- Flip tracking for "first pullback only" (Short ST flips)
+var int  lastFlipUpBar   = na
+var int  lastFlipDnBar   = na
+var bool tookEntryAfterFlipUp = false
+var bool tookEntryAfterFlipDn = false
+
+flipUp   = (dirShortEff == 1)  and (dirShortEff[1] != 1)
+flipDown = (dirShortEff == -1) and (dirShortEff[1] != -1)
+
+if flipUp
+    lastFlipUpBar := bar_index
+    tookEntryAfterFlipUp := false
+if flipDown
+    lastFlipDnBar := bar_index
+    tookEntryAfterFlipDn := false
+
+barsSinceFlipUp   = na(lastFlipUpBar) ? 1e9 : bar_index - lastFlipUpBar
+barsSinceFlipDown = na(lastFlipDnBar) ? 1e9 : bar_index - lastFlipDnBar
+
+withinWindowLong = not useWindow or (barsSinceFlipUp <= entryWindow and not tookEntryAfterFlipUp)
+withinWindowSh   = not useWindow or (barsSinceFlipDown <= entryWindow and not tookEntryAfterFlipDn)
+pullbackTouchedL = not requireTouch or low  <= stS_line
+pullbackTouchedS = not requireTouch or high >= stS_line
+
+// --- Entry conditions (regime + trigger + ST alignment + gating)
+longCond_base  = bullHTF and rsiLTF > rsiStrong and dirShortEff == 1 and dirLongEff == 1
+shortCond_base = allowShorts and bearHTF and rsiLTF < rsiWeak and dirShortEff == -1 and dirLongEff == -1
+
+longCond  = longCond_base  and withinWindowLong and pullbackTouchedL
+shortCond = shortCond_base and withinWindowSh   and pullbackTouchedS
+
+if longCond and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long)
+    tookEntryAfterFlipUp := true
+
+if shortCond and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short)
+    tookEntryAfterFlipDn := true
+
+//======================== Exits / Targets ==================
+atrStop = ta.atr(atrLenStop)
+
+var bool  targetsSeeded = false
+isNewLong  = strategy.position_size[1] <= 0 and strategy.position_size > 0
+isNewShort = strategy.position_size[1] >= 0 and strategy.position_size < 0
+
+var float longEntryPrice  = na, float longStopPrice = na, float longTgt1 = na, float longTgt2 = na
+var float shortEntryPrice = na, float shortStopPrice = na, float shortTgt1 = na, float shortTgt2 = na
+
+if isNewLong
+    longEntryPrice := strategy.position_avg_price
+    longStopPrice  := (riskFrom == "Long ST") ? stL_line : (longEntryPrice - atrStop * atrMultStop)
+    riskR = math.max(longEntryPrice - longStopPrice, syminfo.mintick)
+    longTgt1 := longEntryPrice + take1R * riskR
+    longTgt2 := longEntryPrice + take2R * riskR
+    targetsSeeded := true
+
+if isNewShort
+    shortEntryPrice := strategy.position_avg_price
+    shortStopPrice  := (riskFrom == "Long ST") ? stL_line : (shortEntryPrice + atrStop * atrMultStop)
+    riskR = math.max(shortStopPrice - shortEntryPrice, syminfo.mintick)
+    shortTgt1 := shortEntryPrice - take1R * riskR
+    shortTgt2 := shortEntryPrice - take2R * riskR
+    targetsSeeded := true
+
+// Protective exits + flip exits
+if strategy.position_size > 0
+    if useTargets and targetsSeeded
+        strategy.exit("Long T1", from_entry="Long", qty_percent=tgtQty1,           limit=longTgt1, stop=trailWithST ? stL_line : longStopPrice)
+        strategy.exit("Long T2", from_entry="Long", qty_percent=100 - tgtQty1,     limit=longTgt2, stop=trailWithST ? stL_line : longStopPrice)
+    else if trailWithST
+        strategy.exit("Long X",  from_entry="Long", stop=stL_line)
+if strategy.position_size < 0
+    if useTargets and targetsSeeded
+        strategy.exit("Short T1", from_entry="Short", qty_percent=tgtQty1,        limit=shortTgt1, stop=trailWithST ? stL_line : shortStopPrice)
+        strategy.exit("Short T2", from_entry="Short", qty_percent=100 - tgtQty1,  limit=shortTgt2, stop=trailWithST ? stL_line : shortStopPrice)
+    else if trailWithST
+        strategy.exit("Short X",  from_entry="Short", stop=stL_line)
+
+// Close-on-trend-flip (based on dashboard trend source)
+emaB = ta.ema(close, emaLen)
+trendUp = trendSource == "Long Supertrend"  ? (dirLongEff  == 1) : trendSource == "Short Supertrend" ? (dirShortEff == 1) : (close > emaB)
+
+if useSTExit
+    if strategy.position_size > 0 and not trendUp
+        strategy.close("Long", comment="Trend down")
+    if strategy.position_size < 0 and trendUp
+        strategy.close("Short", comment="Trend up")
+
+if strategy.position_size == 0
+    targetsSeeded := false
+
+//======================== Stats for Dashboard ============
+rng   = high - low
+adr   = ta.sma(rng, adrLen)
+adrPct= 100.0 * adr / close
+
+distP = 100.0 * (close - emaB) / emaB
+extTh = adrPct * extMult
+isExtended = math.abs(distP) > extTh
+
+atr = ta.atr(atrLen)
+atrPct = 100.0 * atr / close
+
+benchClose = request.security(benchSym, timeframe.period, close)
+rsLine = benchClose == 0 ? na : (close / benchClose) * 100.0
+rsRoc  = ta.roc(rsLine, rsLen)
+rsUnder = rsRoc < 0
+
+mScore = 0
+mScore += bullHTF ? 1 : (bearHTF ? -1 : 0)
+mScore += trendUp ? 1 : -1
+mScore += rsiLTF > rsiStrong ? 1 : (rsiLTF < rsiWeak ? -1 : 0)
+momText = mScore >= 2 ? "Momentum STRONG" : mScore <= -2 ? "Momentum WEAK" : "Momentum MIXED"
+
+maxSLpct = 100.0 * math.abs(close - stL_line) / close
+
+//======================== Smart-Money Dots ===============
+volSma  = ta.sma(volume, volLen)
+volSurge= volume > volSma * volMult
+wrb     = rng > atr * wrbMult
+posClose= (close - low) / math.max(rng, 1e-6) >= closeBias
+negClose= (high - close) / math.max(rng, 1e-6) >= closeBias
+
+smartBuy = showDots and volSurge and wrb and posClose and dirShortEff == 1
+smartSell= showDots and volSurge and wrb and negClose and dirShortEff == -1
+
+plotshape(smartBuy,  title="Smart Money Buy",  style=shape.circle, size=size.tiny, location=location.belowbar)
+plotshape(smartSell, title="Smart Money Sell", style=shape.circle, size=size.tiny, location=location.abovebar)
+
+//======================== Supertrend Rendering ==========================
+// Cloud that sits AWAY from candles (based on Long ST)
+atrVis   = ta.atr(stL_Atr) // visual offset period
+innerBand = stL_line
+outerBand = dirLongEff == 1 ? (stL_line - atrVis * cloudATRK) : (stL_line + atrVis * cloudATRK)
+
+innerUp   = dirLongEff == 1 ? innerBand : na
+outerUp   = dirLongEff == 1 ? outerBand : na
+innerDown = dirLongEff == -1 ? innerBand : na
+outerDown = dirLongEff == -1 ? outerBand : na
+
+//if useCloud
+pIU = plot(innerUp,  "ST inner (Up)",   linewidth=2, style=plot.style_linebr, color=color.new(color.lime, showBorder ? 0 : 100))
+pOU = plot(outerUp,  "ST outer (Up)",   linewidth=1, style=plot.style_linebr, color=color.new(color.lime, 100))
+fill(pIU, pOU, color=color.new(color.lime, 85))
+pID = plot(innerDown,"ST inner (Down)", linewidth=2, style=plot.style_linebr, color=color.new(color.red,  showBorder ? 0 : 100))
+pOD = plot(outerDown,"ST outer (Down)", linewidth=1, style=plot.style_linebr, color=color.new(color.red,  100))
+fill(pID, pOD, color=color.new(color.red, 85))
+//else
+//    shortUp   = dirShortEff == 1  ? stS_line : na
+//    shortDown = dirShortEff == -1 ? stS_line : na
+//    longUp    = dirLongEff  == 1  ? stL_line : na
+//    longDown  = dirLongEff  == -1 ? stL_line : na
+//    plot(longUp,   "Long ST (Up)",   color=color.new(color.lime, 0),  linewidth=3, style=plot.style_linebr)
+ //   plot(longDown, "Long ST (Down)", color=color.new(color.red,  0),  linewidth=3, style=plot.style_linebr)
+ //   plot(shortUp,  "Short ST (Up)",  color=color.new(color.teal, 0),  linewidth=2, style=plot.style_linebr)
+ //   plot(shortDown,"Short ST (Down)",color=color.new(color.orange,0), linewidth=2, style=plot.style_linebr)
+
+// Optional candle coloring by trendUp
+barcolor(trendUp ? color.new(color.lime, 0) : color.new(color.red, 0))
+
+// Entry markers
+plotchar(longCond,  "Long Entry setup",  "🟢", location.belowbar, size=size.tiny)
+plotchar(shortCond, "Short Entry setup", "🔴", location.abovebar,  size=size.tiny)
+// hline(50, "RSI Midline", color=color.new(color.gray, 80))
+
+//======================== Dashboard ======================
+var table dash = na
+
+f_row(tbl, rowIdx, label, valueText, good, warn, bad) =>
+    col = good ? color.new(color.lime, 0) : warn ? color.new(color.yellow, 0) : bad ? color.new(color.red, 0) : color.new(color.white, 0)
+    table.cell(tbl, 0, rowIdx, label, text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(tbl, 1, rowIdx, valueText, text_color=color.black, bgcolor=col)
+
+if showDash
+    if na(dash)
+        dash := table.new(position.top_right, 2, 10, frame_width=1)
+    if barstate.islast
+        table.clear(dash, 0, 0, 1, 9)
+        table.cell(dash, 0, 0, "— Dashboard —", text_color=color.white, bgcolor=color.new(color.black, 0))
+        table.cell(dash, 1, 0, "")
+        table.merge_cells(dash, 0, 0, 1, 0)
+        f_row(dash, 1, "ADR",            str.tostring(adrPct, "#.##") + " %", true, false, false)
+        f_row(dash, 2, "Stock Extended", (isExtended ? "YES" : "No") + " (" + str.tostring(math.abs(distP), "#.##") + "% vs " + str.tostring(extTh, "#.##") + "%)", not isExtended, isExtended, false)
+        f_row(dash, 3, "Momentum",       momText, mScore >= 2, mScore == 0, mScore <= -2)
+        f_row(dash, 4, "Trend",          trendUp ? "UP" : "DOWN", trendUp, false, not trendUp)
+        f_row(dash, 5, "Volatility",     str.tostring(atrPct, "#.##") + " %", false, false, false)
+        f_row(dash, 6, "Max Stoploss",   str.tostring(maxSLpct, "#.##") + " %", maxSLpct <= 5, maxSLpct > 5 and maxSLpct <= 10, maxSLpct > 10)
+        rsTxt = na(rsRoc) ? "NA" : (rsUnder ? "RS-UNDERPERFORMING" : "RS-OUTPERFORMING") + " (" + str.tostring(rsRoc, "#.##") + "%/" + str.tostring(rsLen) + "b)"
+        f_row(dash, 7, "Relative Strength", rsTxt, not rsUnder, false, rsUnder)
+        regTxt = bullHTF ? "Daily RSI Bull" : bearHTF ? "Daily RSI Bear" : "Daily RSI Neutral"
+        f_row(dash, 8, "Regime",         regTxt, bullHTF, not (bullHTF or bearHTF), bearHTF)
+else
+    if not na(dash)
+        table.clear(dash, 0, 0, 1, 9)
