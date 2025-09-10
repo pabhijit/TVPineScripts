@@ -1,4 +1,3 @@
-// © pabhijit
 //@version=6
 indicator("Key Session Levels (Prev Day + Overnight) + ORB", overlay=true)
 
@@ -50,7 +49,7 @@ if newRTH
 ONH = onh_today
 ONL = onl_today
 
-// ===== Apply “today only” filter (for the key levels)
+// ===== Apply “today only” filter (key levels)
 val_pdo = showTodayOnly ? (isToday ? pdo : na) : pdo
 val_pdh = showTodayOnly ? (isToday ? pdh : na) : pdh
 val_pdl = showTodayOnly ? (isToday ? pdl : na) : pdl
@@ -65,8 +64,10 @@ cPDL = useColors ? color.red    : color.white
 cPDC = useColors ? color.yellow : color.white
 cONH = useColors ? color.teal   : color.white
 cONL = useColors ? color.orange : color.white
+cEM  = color.new(color.fuchsia, 0)
+cFri = color.new(color.blue, 0)
 
-// ===== Plots
+// ===== Plots (key levels)
 plot(val_pdo, "PDO (Prev Open)",  cPDO, 1)
 plot(val_pdh, "PDH (Prev High)",  cPDH, 1)
 plot(val_pdl, "PDL (Prev Low)",   cPDL, 1)
@@ -77,9 +78,9 @@ plot(val_onl, "ONL (Overnight Low)" , cONL, 1)
 // ===== ORB sessions pinned to NY time
 inORBrange = not na(time(timeframe.period, ORBrange,  NY_TZ))
 inExtend   = not na(time(timeframe.period, ORBextend, NY_TZ))
-startRTH   = inExtend and not inExtend[1]         // first 09:30 bar of the RTH day
-startORB   = inORBrange and not inORBrange[1]     // first bar of ORB window
-endORB     = not inORBrange and inORBrange[1]     // first bar after ORB window
+startRTH   = inExtend and not inExtend[1]
+startORB   = inORBrange and not inORBrange[1]
+endORB     = not inORBrange and inORBrange[1]
 
 // ===== ORB state (only for TODAY)
 var int   orbLeft  = na
@@ -89,7 +90,6 @@ var float orbLow   = na
 var box   orbBox   = na
 var bool  orbLive  = false
 
-// Hard-stop: if this bar is NOT today and a box exists, kill it (prevents yesterday showing)
 if not isToday
     if not na(orbBox)
         box.delete(orbBox)
@@ -100,7 +100,6 @@ if not isToday
     orbHigh := na
     orbLow  := na
 
-// Reset at start of today's RTH
 if isToday and startRTH
     if not na(orbBox)
         box.delete(orbBox)
@@ -111,7 +110,6 @@ if isToday and startRTH
     orbHigh := na
     orbLow  := na
 
-// Start ORB ONLY for today's bars
 if isToday and showORB and startORB
     orbLeft := bar_index
     orbRight := bar_index
@@ -121,7 +119,6 @@ if isToday and showORB and startORB
     box.set_bgcolor(orbBox, ShadeColor)
     orbLive := true
 
-// Update highs/lows only inside today's ORB window
 if isToday and inORBrange and orbLive
     if high > orbHigh
         orbHigh := high
@@ -130,13 +127,82 @@ if isToday and inORBrange and orbLive
         orbLow := low
         box.set_bottom(orbBox, orbLow)
 
-// Extend box during today's extension window
 if isToday and inExtend and orbLive
     orbRight := bar_index
     box.set_right(orbBox, orbRight)
 
-// ORB “ready” only after today's ORB window ends
 orbReady = isToday and orbLive and endORB and inExtend and not na(orbHigh) and not na(orbLow)
+
+// ===== Expected Move (auto vol index + overrides)
+grpEM            = "Expected Move"
+emMethod         = input.string("IV Proxy (Auto)", "Method", options=["IV Proxy (Auto)","IV Proxy (Override)","Manual IV%","ATR(14)"], group=grpEM)
+volIndexOverride = input.symbol("CBOE:VIX", "Vol Index (override)", group=grpEM)
+manualIVpct      = input.float(25.0, "Manual IV %", minval=0, group=grpEM)
+emSigmaMult      = input.float(1.0, "Sigma multiple", minval=0.1, step=0.1, group=grpEM)
+emUsePrevClose   = input.bool(true, "Base on Previous Close (PDC)", group=grpEM)
+emATRlen         = input.int(14, "ATR length (if ATR method)", minval=1, group=grpEM)
+
+f_autoVolSym() =>
+    sym  = str.upper(syminfo.ticker)
+    root = str.upper(syminfo.root)
+    exch = str.upper(syminfo.prefix)
+
+    // S&P family
+    if sym == "SPY" or sym == "SPX" or sym == "SPX500USD" or root == "ES" or root == "MES" or str.substring(sym, 0, 3) == "SPX"
+        "CBOE:VIX"
+    // Nasdaq 100 family
+    else if sym == "QQQ" or sym == "NDX" or str.contains(sym, "NAS100") or root == "NQ" or root == "MNQ"
+        "CBOE:VXN"
+    // Russell 2000 family
+    else if sym == "IWM" or sym == "RUT" or root == "RTY" or str.contains(sym, "US2000")
+        "CBOE:RVX"
+    // Dow family
+    else if sym == "DIA" or sym == "DJI" or sym == "DJX" or root == "YM" or str.contains(sym, "US30")
+        "CBOE:VXD"
+    // Single stocks: NASDAQ → VXN, otherwise VIX
+    else
+        exch == "NASDAQ" ? "CBOE:VXN" : "CBOE:VIX"
+
+
+volIndexSymAuto = f_autoVolSym()
+useSym = emMethod == "IV Proxy (Auto)" ? volIndexSymAuto : volIndexOverride
+basePrice = emUsePrevClose ? pdc : close
+
+volIdx = (emMethod == "IV Proxy (Auto)" or emMethod == "IV Proxy (Override)") ? request.security(useSym, "D", close, lookahead=barmerge.lookahead_on) : na
+iv_annual = nz(volIdx) / 100.0
+oneDaySigma = iv_annual * math.sqrt(1.0/252.0)
+em_from_iv  = basePrice * oneDaySigma * emSigmaMult
+em_from_atr = ta.atr(emATRlen) * emSigmaMult
+iv_manual   = manualIVpct/100.0
+em_from_manual = basePrice * iv_manual * math.sqrt(1.0/252.0) * emSigmaMult
+
+em_val =
+     emMethod == "IV Proxy (Auto)"      ? em_from_iv :
+     emMethod == "IV Proxy (Override)"  ? em_from_iv :
+     emMethod == "Manual IV%"           ? em_from_manual :
+                                          em_from_atr
+
+emU_raw = basePrice + em_val
+emL_raw = basePrice - em_val
+emU = showTodayOnly ? (isToday ? emU_raw : na) : emU_raw
+emL = showTodayOnly ? (isToday ? emL_raw : na) : emL_raw
+
+plot(emU, "EM Upper", cEM, 1)
+plot(emL, "EM Lower", cEM, 1)
+
+// ===== Previous Week's Friday High/Low
+grpFriday    = "Friday Levels"
+showFridayHL = input.bool(true, "Show Last Friday High/Low", group=grpFriday)
+
+// Use daily context to fetch the MOST RECENT completed Friday (index 1)
+friH_prev = request.security(syminfo.tickerid, "D", ta.valuewhen(dayofweek == dayofweek.friday, high, 1), lookahead=barmerge.lookahead_on)
+friL_prev = request.security(syminfo.tickerid, "D", ta.valuewhen(dayofweek == dayofweek.friday, low,  1), lookahead=barmerge.lookahead_on)
+
+val_friH = showFridayHL ? (showTodayOnly ? (isToday ? friH_prev : na) : friH_prev) : na
+val_friL = showFridayHL ? (showTodayOnly ? (isToday ? friL_prev : na) : friL_prev) : na
+
+plot(val_friH, "Friday High (Prev Week)", cFri, 1)
+plot(val_friL, "Friday Low (Prev Week)" , cFri, 1)
 
 // ===== Right-edge labels
 var label lPDO = na
@@ -145,37 +211,58 @@ var label lPDL = na
 var label lPDC = na
 var label lONH = na
 var label lONL = na
-if barstate.islast and showRightLabels
-    if not na(lPDO)
-        label.delete(lPDO)
-    if not na(lPDH)
-        label.delete(lPDH)
-    if not na(lPDL)
-        label.delete(lPDL)
-    if not na(lPDC)
-        label.delete(lPDC)
-    if not na(lONH)
-        label.delete(lONH)
-    if not na(lONL)
-        label.delete(lONL)
-    if not na(val_pdo)
-        lPDO := label.new(bar_index + rightOffsetBars, val_pdo, "PDO", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDO, size=size.tiny)
-    if not na(val_pdh)
-        lPDH := label.new(bar_index + rightOffsetBars, val_pdh, "PDH", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDH, size=size.tiny)
-    if not na(val_pdl)
-        lPDL := label.new(bar_index + rightOffsetBars, val_pdl, "PDL", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDL, size=size.tiny)
-    if not na(val_pdc)
-        lPDC := label.new(bar_index + rightOffsetBars, val_pdc, "PDC", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDC, size=size.tiny)
-    if not na(val_onh)
-        lONH := label.new(bar_index + rightOffsetBars, val_onh, "ONH", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cONH, size=size.tiny)
-    if not na(val_onl)
-        lONL := label.new(bar_index + rightOffsetBars, val_onl, "ONL", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cONL, size=size.tiny)
+var label lEMu = na
+var label lEMl = na
+var label lFriH = na
+var label lFriL = na
 
-// ===== Legend (2 cols × 6 rows)
+if barstate.islast and showRightLabels
+    if not na(lPDO)  
+        label.delete(lPDO)
+    if not na(lPDH)  
+        label.delete(lPDH)
+    if not na(lPDL)  
+        label.delete(lPDL)
+    if not na(lPDC)  
+        label.delete(lPDC)
+    if not na(lONH)  
+        label.delete(lONH)
+    if not na(lONL)  
+        label.delete(lONL)
+    if not na(lEMu)  
+        label.delete(lEMu)
+    if not na(lEMl)  
+        label.delete(lEMl)
+    if not na(lFriH) 
+        label.delete(lFriH)
+    if not na(lFriL) 
+        label.delete(lFriL)
+    if not na(val_pdo)  
+        lPDO  := label.new(bar_index + rightOffsetBars, val_pdo, "PDO",  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDO, size=size.tiny)
+    if not na(val_pdh)  
+        lPDH  := label.new(bar_index + rightOffsetBars, val_pdh, "PDH",  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDH, size=size.tiny)
+    if not na(val_pdl)  
+        lPDL  := label.new(bar_index + rightOffsetBars, val_pdl, "PDL",  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDL, size=size.tiny)
+    if not na(val_pdc)  
+        lPDC  := label.new(bar_index + rightOffsetBars, val_pdc, "PDC",  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDC, size=size.tiny)
+    if not na(val_onh)  
+        lONH  := label.new(bar_index + rightOffsetBars, val_onh, "ONH",  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cONH, size=size.tiny)
+    if not na(val_onl)  
+        lONL  := label.new(bar_index + rightOffsetBars, val_onl, "ONL",  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cONL, size=size.tiny)
+    if not na(emU)      
+        lEMu  := label.new(bar_index + rightOffsetBars, emU,     "EM+",  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cEM,  size=size.tiny)
+    if not na(emL)      
+        lEMl  := label.new(bar_index + rightOffsetBars, emL,     "EM−",  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cEM,  size=size.tiny)
+    if not na(val_friH) 
+        lFriH := label.new(bar_index + rightOffsetBars, val_friH,"FriH", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cFri, size=size.tiny)
+    if not na(val_friL) 
+        lFriL := label.new(bar_index + rightOffsetBars, val_friL,"FriL", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cFri, size=size.tiny)
+
+// ===== Legend (2 cols × 10 rows)
 var table t = na
 if showLegendTbl
     if na(t)
-        t := table.new(position.top_right, 2, 6)
+        t := table.new(position.top_right, 2, 10)
     if barstate.islast
         table.cell(t, 0, 0, "PDO", text_color=color.black, bgcolor=cPDO)
         table.cell(t, 1, 0, na(val_pdo) ? "" : str.tostring(val_pdo, format.mintick), text_color=color.black, bgcolor=color.new(cPDO, 60))
@@ -189,8 +276,16 @@ if showLegendTbl
         table.cell(t, 1, 4, na(val_onh) ? "" : str.tostring(val_onh, format.mintick), text_color=color.black, bgcolor=color.new(cONH, 60))
         table.cell(t, 0, 5, "ONL", text_color=color.black, bgcolor=cONL)
         table.cell(t, 1, 5, na(val_onl) ? "" : str.tostring(val_onl, format.mintick), text_color=color.black, bgcolor=color.new(cONL, 60))
+        table.cell(t, 0, 6, "EM+", text_color=color.black, bgcolor=cEM)
+        table.cell(t, 1, 6, na(emU) ? "" : str.tostring(emU, format.mintick), text_color=color.black, bgcolor=color.new(cEM, 60))
+        table.cell(t, 0, 7, "EM−", text_color=color.black, bgcolor=cEM)
+        table.cell(t, 1, 7, na(emL) ? "" : str.tostring(emL, format.mintick), text_color=color.black, bgcolor=color.new(cEM, 60))
+        table.cell(t, 0, 8, "FriH", text_color=color.black, bgcolor=cFri)
+        table.cell(t, 1, 8, na(val_friH) ? "" : str.tostring(val_friH, format.mintick), text_color=color.black, bgcolor=color.new(cFri, 60))
+        table.cell(t, 0, 9, "FriL", text_color=color.black, bgcolor=cFri)
+        table.cell(t, 1, 9, na(val_friL) ? "" : str.tostring(val_friL, format.mintick), text_color=color.black, bgcolor=color.new(cFri, 60))
 
-// ===== Alerts
+// ===== Alerts (unchanged from your base)
 havePDH = not na(val_pdh)
 havePDL = not na(val_pdl)
 haveONH = not na(val_onh)
