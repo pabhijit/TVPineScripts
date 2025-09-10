@@ -1,0 +1,207 @@
+// © pabhijit
+//@version=6
+indicator("Key Session Levels (Prev Day + Overnight) + ORB", overlay=true)
+
+// ===== Inputs
+showTodayOnly   = input.bool(true,  "Show Today Only")
+showRightLabels = input.bool(true,  "Right-edge Labels")
+rightOffsetBars = input.int (20,    "Right Label Offset (bars)", minval=1, maxval=500)
+showLegendTbl   = input.bool(true,  "Show Top-Right Legend")
+useColors       = input.bool(true,  "Color-code Levels")
+
+// ORB inputs
+_ORB       = "Opening Range Break Settings"
+ORBrange   = input.session("0930-0945", "Opening Range", group=_ORB)
+ORBextend  = input.session("0930-1600", "Extend Range Lines", group=_ORB)
+_ORBcolors = "Opening Range Colors"
+showORB    = input.bool(true, "Enable Opening Range Box", inline="ORB top", group=_ORBcolors)
+BorderColor= input.color(color.new(color.purple, 40), "Border", inline="ORB bottom", group=_ORBcolors)
+ShadeColor = input.color(color.new(color.white, 90), "Background", inline="ORB bottom", group=_ORBcolors)
+linesWidth = input.int(1, "Width", minval=1, maxval=4, inline="ORB bottom", group=_ORBcolors)
+
+// ===== Sessions & “today”
+var string NY_TZ = "America/New_York"
+rth       = not na(time(timeframe.period, "0930-1600", NY_TZ))
+onSession = not rth
+isToday   = (dayofmonth(time) == dayofmonth(timenow)) and (month(time) == month(timenow)) and (year(time) == year(timenow))
+
+// ===== Previous-day levels
+pdo = request.security(syminfo.tickerid, "D", open[1],  lookahead=barmerge.lookahead_on)
+pdh = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_on)
+pdc = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+
+// ===== Overnight range (prior to today’s RTH)
+var float onHigh = na
+var float onLow  = na
+newON  = onSession and not onSession[1]
+newRTH = rth and not rth[1]
+if newON
+    onHigh := high
+    onLow  := low
+else if onSession
+    onHigh := math.max(nz(onHigh, high), high)
+    onLow  := math.min(nz(onLow,  low),  low)
+var float onh_today = na
+var float onl_today = na
+if newRTH
+    onh_today := onHigh
+    onl_today := onLow
+ONH = onh_today
+ONL = onl_today
+
+// ===== Apply “today only” filter (for the key levels)
+val_pdo = showTodayOnly ? (isToday ? pdo : na) : pdo
+val_pdh = showTodayOnly ? (isToday ? pdh : na) : pdh
+val_pdl = showTodayOnly ? (isToday ? pdl : na) : pdl
+val_pdc = showTodayOnly ? (isToday ? pdc : na) : pdc
+val_onh = showTodayOnly ? (isToday ? ONH : na) : ONH
+val_onl = showTodayOnly ? (isToday ? ONL : na) : ONL
+
+// ===== Colors
+cPDO = useColors ? color.silver : color.white
+cPDH = useColors ? color.lime   : color.white
+cPDL = useColors ? color.red    : color.white
+cPDC = useColors ? color.yellow : color.white
+cONH = useColors ? color.teal   : color.white
+cONL = useColors ? color.orange : color.white
+
+// ===== Plots
+plot(val_pdo, "PDO (Prev Open)",  cPDO, 1)
+plot(val_pdh, "PDH (Prev High)",  cPDH, 1)
+plot(val_pdl, "PDL (Prev Low)",   cPDL, 1)
+plot(val_pdc, "PDC (Prev Close)", cPDC, 1)
+plot(val_onh, "ONH (Overnight High)", cONH, 1)
+plot(val_onl, "ONL (Overnight Low)" , cONL, 1)
+
+// ===== ORB sessions pinned to NY time
+inORBrange = not na(time(timeframe.period, ORBrange,  NY_TZ))
+inExtend   = not na(time(timeframe.period, ORBextend, NY_TZ))
+startRTH   = inExtend and not inExtend[1]         // first 09:30 bar of the RTH day
+startORB   = inORBrange and not inORBrange[1]     // first bar of ORB window
+endORB     = not inORBrange and inORBrange[1]     // first bar after ORB window
+
+// ===== ORB state (only for TODAY)
+var int   orbLeft  = na
+var int   orbRight = na
+var float orbHigh  = na
+var float orbLow   = na
+var box   orbBox   = na
+var bool  orbLive  = false
+
+// Hard-stop: if this bar is NOT today and a box exists, kill it (prevents yesterday showing)
+if not isToday
+    if not na(orbBox)
+        box.delete(orbBox)
+    orbBox := na
+    orbLive := false
+    orbLeft := na
+    orbRight := na
+    orbHigh := na
+    orbLow  := na
+
+// Reset at start of today's RTH
+if isToday and startRTH
+    if not na(orbBox)
+        box.delete(orbBox)
+    orbBox := na
+    orbLive := false
+    orbLeft := na
+    orbRight := na
+    orbHigh := na
+    orbLow  := na
+
+// Start ORB ONLY for today's bars
+if isToday and showORB and startORB
+    orbLeft := bar_index
+    orbRight := bar_index
+    orbHigh := high
+    orbLow  := low
+    orbBox := box.new(left=orbLeft, top=orbHigh, right=orbRight, bottom=orbLow, border_color=BorderColor, border_width=linesWidth)
+    box.set_bgcolor(orbBox, ShadeColor)
+    orbLive := true
+
+// Update highs/lows only inside today's ORB window
+if isToday and inORBrange and orbLive
+    if high > orbHigh
+        orbHigh := high
+        box.set_top(orbBox, orbHigh)
+    if low < orbLow
+        orbLow := low
+        box.set_bottom(orbBox, orbLow)
+
+// Extend box during today's extension window
+if isToday and inExtend and orbLive
+    orbRight := bar_index
+    box.set_right(orbBox, orbRight)
+
+// ORB “ready” only after today's ORB window ends
+orbReady = isToday and orbLive and endORB and inExtend and not na(orbHigh) and not na(orbLow)
+
+// ===== Right-edge labels
+var label lPDO = na
+var label lPDH = na
+var label lPDL = na
+var label lPDC = na
+var label lONH = na
+var label lONL = na
+if barstate.islast and showRightLabels
+    if not na(lPDO)
+        label.delete(lPDO)
+    if not na(lPDH)
+        label.delete(lPDH)
+    if not na(lPDL)
+        label.delete(lPDL)
+    if not na(lPDC)
+        label.delete(lPDC)
+    if not na(lONH)
+        label.delete(lONH)
+    if not na(lONL)
+        label.delete(lONL)
+    if not na(val_pdo)
+        lPDO := label.new(bar_index + rightOffsetBars, val_pdo, "PDO", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDO, size=size.tiny)
+    if not na(val_pdh)
+        lPDH := label.new(bar_index + rightOffsetBars, val_pdh, "PDH", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDH, size=size.tiny)
+    if not na(val_pdl)
+        lPDL := label.new(bar_index + rightOffsetBars, val_pdl, "PDL", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDL, size=size.tiny)
+    if not na(val_pdc)
+        lPDC := label.new(bar_index + rightOffsetBars, val_pdc, "PDC", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDC, size=size.tiny)
+    if not na(val_onh)
+        lONH := label.new(bar_index + rightOffsetBars, val_onh, "ONH", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cONH, size=size.tiny)
+    if not na(val_onl)
+        lONL := label.new(bar_index + rightOffsetBars, val_onl, "ONL", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cONL, size=size.tiny)
+
+// ===== Legend (2 cols × 6 rows)
+var table t = na
+if showLegendTbl
+    if na(t)
+        t := table.new(position.top_right, 2, 6)
+    if barstate.islast
+        table.cell(t, 0, 0, "PDO", text_color=color.black, bgcolor=cPDO)
+        table.cell(t, 1, 0, na(val_pdo) ? "" : str.tostring(val_pdo, format.mintick), text_color=color.black, bgcolor=color.new(cPDO, 60))
+        table.cell(t, 0, 1, "PDH", text_color=color.black, bgcolor=cPDH)
+        table.cell(t, 1, 1, na(val_pdh) ? "" : str.tostring(val_pdh, format.mintick), text_color=color.black, bgcolor=color.new(cPDH, 60))
+        table.cell(t, 0, 2, "PDL", text_color=color.black, bgcolor=cPDL)
+        table.cell(t, 1, 2, na(val_pdl) ? "" : str.tostring(val_pdl, format.mintick), text_color=color.black, bgcolor=color.new(cPDL, 60))
+        table.cell(t, 0, 3, "PDC", text_color=color.black, bgcolor=cPDC)
+        table.cell(t, 1, 3, na(val_pdc) ? "" : str.tostring(val_pdc, format.mintick), text_color=color.black, bgcolor=color.new(cPDC, 60))
+        table.cell(t, 0, 4, "ONH", text_color=color.black, bgcolor=cONH)
+        table.cell(t, 1, 4, na(val_onh) ? "" : str.tostring(val_onh, format.mintick), text_color=color.black, bgcolor=color.new(cONH, 60))
+        table.cell(t, 0, 5, "ONL", text_color=color.black, bgcolor=cONL)
+        table.cell(t, 1, 5, na(val_onl) ? "" : str.tostring(val_onl, format.mintick), text_color=color.black, bgcolor=color.new(cONL, 60))
+
+// ===== Alerts
+havePDH = not na(val_pdh)
+havePDL = not na(val_pdl)
+haveONH = not na(val_onh)
+haveONL = not na(val_onl)
+alertcondition(havePDH and ta.crossover(close, val_pdh), "Cross Above PDH", "Price crossed ABOVE Previous Day High (PDH)")
+alertcondition(havePDH and ta.crossunder(close, val_pdh), "Cross Below PDH", "Price crossed BELOW Previous Day High (PDH)")
+alertcondition(havePDL and ta.crossover(close, val_pdl), "Cross Above PDL", "Price crossed ABOVE Previous Day Low (PDL)")
+alertcondition(havePDL and ta.crossunder(close, val_pdl), "Cross Below PDL", "Price crossed BELOW Previous Day Low (PDL)")
+alertcondition(haveONH and ta.crossover(close, val_onh), "Cross Above ONH", "Price crossed ABOVE Overnight High (ONH)")
+alertcondition(haveONH and ta.crossunder(close, val_onh), "Cross Below ONH", "Price crossed BELOW Overnight High (ONH)")
+alertcondition(haveONL and ta.crossover(close, val_onl), "Cross Above ONL", "Price crossed ABOVE Overnight Low (ONL)")
+alertcondition(haveONL and ta.crossunder(close, val_onl), "Cross Below ONL", "Price crossed BELOW Overnight Low (ONL)")
+alertcondition(orbReady and ta.crossover(close, orbHigh), "ORB Breakout Up", "Price broke ABOVE ORB High (today)")
+alertcondition(orbReady and ta.crossunder(close, orbLow), "ORB Breakdown",   "Price broke BELOW ORB Low (today)")
