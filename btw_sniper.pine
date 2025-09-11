@@ -1,0 +1,232 @@
+//@version=6
+indicator("BTC Sniper (Z-Score + Trend Filter)", shorttitle="BTC Sniper", overlay=true)
+
+//━━━━━━━━━━━━━━━━━━ Inputs ━━━━━━━━━━━━━━━━━━
+grpData   = "Data Sources"
+symLongs  = input.symbol("BITFINEX:BTCUSDLONGS", "Bitfinex Longs",  group=grpData)
+symShorts = input.symbol("BITFINEX:BTCUSDSHORTS","Bitfinex Shorts", group=grpData)
+srcTf     = input.timeframe("", "Source timeframe (blank = chart)", group=grpData)
+
+grpCalc   = "Signal Engine"
+lookbackZ = input.int(100,  "Z-Score Lookback", minval=20, group=grpCalc)
+emaDeltaL = input.int(10,   "EMA length for Δ smoothing", minval=1, group=grpCalc)
+thLong    = input.float(0.7,"Oversold threshold (Z ≤ -X)", minval=0.1, step=0.1, group=grpCalc)
+thShort   = input.float(0.7,"Overbought threshold (Z ≥  X)", minval=0.1, step=0.1, group=grpCalc)
+
+grpSig      = "Signal Controls"
+sigMode     = input.string("Standard", "Mode", options=["Strict","Standard","Loose"], group=grpSig)
+confirmBar  = input.bool(true, "Wait for bar close (no repaint)", group=grpSig)
+zGraceBars  = input.int(5, "Z-Extreme grace window (bars)", minval=0, group=grpSig)
+coolBars    = input.int(0, "Legacy cooldown bars (use 0 when spacing is enabled)", minval=0, group=grpSig)
+usePriceFallback = input.bool(true, "Allow price-only fallback when Z is neutral", group=grpSig)
+
+grpTrend  = "Trend Filters"
+useEMAflt = input.bool(true,  "Require EMA Trend Filter (HTF bias)", group=grpTrend)
+emaFastL  = input.int(21,     "EMA Fast (bias)", minval=1, group=grpTrend)
+emaSlowL  = input.int(55,     "EMA Slow (bias)", minval=1, group=grpTrend)
+useVWAP   = input.bool(false, "Also require VWAP bias (↑ for long, ↓ for short)", group=grpTrend)
+
+grpPull   = "First Pullback"
+firstPullOnly = input.bool(true, "Only the first pullback after a new trend", group=grpPull)
+pullReqDepth  = input.string("Into Cloud", "Pullback depth", options=["Touch Cloud","Into Cloud","Touch EMA Fast"], group=grpPull)
+
+grpPost = "Post-Filters"
+confirmBars         = input.int(2,  "Consecutive closes for confirmation", minval=1, group=grpPost)
+requireCloudBreak   = input.bool(true, "Require cloud break (close > top for long, < bottom for short)", group=grpPost)
+minBarsBetween      = input.int(12, "Min bars between any signals", minval=0, group=grpPost)
+minAtrPct           = input.float(0.0, "Min bar range as % of ATR(14) (0 = off)", minval=0, step=0.1, group=grpPost)
+dirChangeOnly       = input.bool(true, "Only first signal after direction change", group=grpPost)
+
+grpViz    = "Visualization"
+showCloud = input.bool(true, "Show EMA9 Envelope Cloud", group=grpViz)
+cloudTrans= input.int(85,    "Cloud Transparency (0–100)", minval=0, maxval=100, group=grpViz)
+showMarks = input.bool(true, "Show Long/Short arrows on price", group=grpViz)
+arrowPad  = input.int(6,     "Arrow offset (ticks from cloud/price)", minval=0, group=grpViz)
+showGauge = input.bool(true, "Show top-right Z-Score gauge", group=grpViz)
+dbgTable  = input.bool(false,"Show debug table", group=grpViz)
+showDots  = input.bool(false,"Show condition dots (debug)", group=grpViz)
+
+//━━━━━━━━━━━━━━━━━━ Data Pull ━━━━━━━━━━━━━━━━━━
+_tf   = (srcTf == "" ? timeframe.period : srcTf)
+L_raw = request.security(symLongs,  _tf, close, lookahead=barmerge.lookahead_on, gaps=barmerge.gaps_off)
+S_raw = request.security(symShorts, _tf, close, lookahead=barmerge.lookahead_on, gaps=barmerge.gaps_off)
+valid = not na(L_raw) and not na(S_raw)
+
+// Net flow (ΔLongs − ΔShorts) smoothed
+dL   = valid ? ta.change(L_raw) : na
+dS   = valid ? ta.change(S_raw) : na
+net  = dL - dS
+netS = ta.ema(net, emaDeltaL)
+
+// Z-Score of net flow
+mean = ta.sma(netS, lookbackZ)
+stdd = ta.stdev(netS, lookbackZ)
+z    = (stdd == 0) ? 0 : (netS - mean) / stdd
+
+oversold      = z <= -thLong
+overbought    = z >=  thShort
+oversoldAny   = oversold   or ta.barssince(oversold)   <= zGraceBars
+overboughtAny = overbought or ta.barssince(overbought) <= zGraceBars
+
+//━━━━━━━━━━━━━━━━━━ Trend Filters ━━━━━━━━━━━━━━━━━━
+emaFast  = ta.ema(close, 9)
+emaSlow  = ta.ema(close, 21)
+turnUp   = ta.crossover(emaFast, emaSlow)
+turnDown = ta.crossunder(emaFast, emaSlow)
+
+emaFastF = ta.ema(close, emaFastL)
+emaSlowF = ta.ema(close, emaSlowL)
+biasUp   = emaFastF > emaSlowF
+biasDn   = emaFastF < emaSlowF
+
+vwap     = ta.vwap
+vwapUp   = close > vwap
+vwapDn   = close < vwap
+
+passTrendLong  = (not useEMAflt or biasUp)  and (not useVWAP or vwapUp)
+passTrendShort = (not useEMAflt or biasDn)  and (not useVWAP or vwapDn)
+
+//━━━━━━━━━━━━━━━━━━ Base Wishes (by strictness) ━━━━━━━━━━━━━━━━━━
+strictLong   = oversoldAny   and turnUp   and passTrendLong
+strictShort  = overboughtAny and turnDown and passTrendShort
+stdLong      = (oversoldAny   and (turnUp   or emaFast > emaSlow)) and passTrendLong
+stdShort     = (overboughtAny and (turnDown or emaFast < emaSlow)) and passTrendShort
+looseLong    = (oversoldAny   and passTrendLong)  or (turnUp   and passTrendLong)
+looseShort   = (overboughtAny and passTrendShort) or (turnDown and passTrendShort)
+
+wantLong  = sigMode == "Strict"   ? strictLong  : sigMode == "Loose" ? looseLong  : stdLong
+wantShort = sigMode == "Strict"   ? strictShort : sigMode == "Loose" ? looseShort : stdShort
+
+// ── Optional price-only fallback when Z is neutral
+fallbackLong  = usePriceFallback and not (oversoldAny or overboughtAny) and passTrendLong  and (turnUp   or emaFast > emaSlow)
+fallbackShort = usePriceFallback and not (oversoldAny or overboughtAny) and passTrendShort and (turnDown or emaFast < emaSlow)
+wantLong  := wantLong  or fallbackLong
+wantShort := wantShort or fallbackShort
+
+//━━━━━━━━━━━━━━━━━━ Cloud (GLOBAL plots) ━━━━━━━━━━━━━━━━━━
+envTopRaw = ta.ema(high, 9)
+envBotRaw = ta.ema(low,  9)
+envTop    = showCloud ? envTopRaw : na
+envBot    = showCloud ? envBotRaw : na
+colCloud  = emaFast >= emaSlow ? color.new(color.lime, cloudTrans) : color.new(color.red, cloudTrans)
+pT = plot(envTop, title="EMA9 High", color=color.new(color.gray,100), linewidth=1, display=display.none)
+pB = plot(envBot, title="EMA9 Low",  color=color.new(color.gray,100), linewidth=1, display=display.none)
+fill(pT, pB, color=showCloud ? colCloud : na)
+
+//━━━━━━━━━━━━━━━━━━ First Pullback State Machine ━━━━━━━━━━━━━━━━━━
+var int regime = 0                       // 1=bull, -1=bear, 0=flat
+regime := emaFast > emaSlow ? 1 : emaFast < emaSlow ? -1 : regime[1]
+regimeChanged = regime != regime[1]
+
+// Track whether a qualifying pullback occurred since the last regime flip
+var bool pbReadyLong  = false
+var bool pbReadyShort = false
+if regimeChanged
+    pbReadyLong  := false
+    pbReadyShort := false
+
+// Define what “pullback” means
+touchCloudLong  = low  <= nz(envTopRaw, high)
+intoCloudLong   = high >= nz(envBotRaw, low) and low <= nz(envTopRaw, high)
+touchFastLong   = low  <= emaFast
+
+touchCloudShort = high >= nz(envBotRaw, low)
+intoCloudShort  = high >= nz(envBotRaw, low) and low <= nz(envTopRaw, high)
+touchFastShort  = high >= emaFast
+
+pullOKLong  = pullReqDepth == "Touch Cloud" ? touchCloudLong  : pullReqDepth == "Into Cloud" ? intoCloudLong  : touchFastLong
+pullOKShort = pullReqDepth == "Touch Cloud" ? touchCloudShort : pullReqDepth == "Into Cloud" ? intoCloudShort : touchFastShort
+
+if regime == 1 and pullOKLong
+    pbReadyLong := true
+if regime == -1 and pullOKShort
+    pbReadyShort := true
+
+// Gate wishes by FPB requirement
+wantLong  := firstPullOnly ? (regime == 1  and pbReadyLong  and wantLong)  : wantLong
+wantShort := firstPullOnly ? (regime == -1 and pbReadyShort and wantShort) : wantShort
+
+//━━━━━━━━━━━━━━━━━━ Post-Filters / Final Signals ━━━━━━━━━━━━━━━━━━
+canFire = confirmBar ? barstate.isconfirmed : true
+
+atr14   = ta.atr(14)
+rangeOK = minAtrPct == 0.0 ? true : (high - low) >= (atr14 * minAtrPct / 100.0)
+cloudOKLong  = not requireCloudBreak or (close > nz(envTopRaw, close))
+cloudOKShort = not requireCloudBreak or (close < nz(envBotRaw, close))
+
+// N consecutive closes above/below EMA-slow using barssince:
+// If the last *violating* close (<=/>=) was at least (confirmBars-1) bars ago, then we have confirmBars consecutive.
+confirmOKLong  = ta.barssince(close <= emaSlow) >= confirmBars - 1
+confirmOKShort = ta.barssince(close >= emaSlow) >= confirmBars - 1
+
+rawLong  = canFire and wantLong
+rawShort = canFire and wantShort
+
+// Spacing and direction de-dup
+var int  lastSignalBar = na
+var int  lastDir       = 0      // 1=long, -1=short
+spacingOK = na(lastSignalBar) or (bar_index - lastSignalBar) >= minBarsBetween
+dirOKLong  = not dirChangeOnly or lastDir <= 0
+dirOKShort = not dirChangeOnly or lastDir >= 0
+
+// Legacy cooldown counter (int)
+var int barsSinceSig = 1000000
+barsSinceSig += 1
+coolOK = barsSinceSig >= coolBars
+
+longSig  = rawLong  and spacingOK and dirOKLong  and confirmOKLong  and cloudOKLong  and rangeOK and coolOK
+shortSig = rawShort and spacingOK and dirOKShort and confirmOKShort and cloudOKShort and rangeOK and coolOK
+
+if longSig
+    lastSignalBar := bar_index
+    lastDir := 1
+    barsSinceSig := 0
+    pbReadyLong := false   // lock further FPB entries until regime flips again
+
+if shortSig
+    lastSignalBar := bar_index
+    lastDir := -1
+    barsSinceSig := 0
+    pbReadyShort := false
+
+//━━━━━━━━━━━━━━━━━━ Marks (labels near cloud) ━━━━━━━━━━━━━━━━━━
+_tick  = syminfo.mintick * arrowPad
+yLong  = not na(envBotRaw) ? envBotRaw - _tick : close
+yShort = not na(envTopRaw) ? envTopRaw + _tick : close
+
+if showMarks and longSig
+    label.new(bar_index, yLong, "Long",  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_triangleup,   color=color.lime, textcolor=color.white, size=size.tiny)
+if showMarks and shortSig
+    label.new(bar_index, yShort, "Short", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_triangledown, color=color.red,  textcolor=color.white, size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━ Alerts ━━━━━━━━━━━━━━━━━━
+alertcondition(longSig,  "Margin Sniper LONG",  "Z / fallback + trend + filters (LONG)")
+alertcondition(shortSig, "Margin Sniper SHORT", "Z / fallback + trend + filters (SHORT)")
+
+//━━━━━━━━━━━━━━━━━━ Gauge ━━━━━━━━━━━━━━━━━━
+var table g = na
+if showGauge
+    if na(g)
+        g := table.new(position.top_right, 2, 4)
+    if barstate.islast
+        table.cell(g, 0, 0, "Z", text_color=color.black, bgcolor=color.new(color.white, 0))
+        zCol = z >= thShort ? color.new(color.red, 0) : z <= -thLong ? color.new(color.lime, 0) : color.new(color.silver, 0)
+        table.cell(g, 1, 0, str.tostring(z, format.mintick), text_color=color.black, bgcolor=color.new(zCol, 70))
+        table.cell(g, 0, 1, "State", text_color=color.black, bgcolor=color.new(color.white, 0))
+        stateTxt = oversold ? "Oversold" : overbought ? "Overbought" : "Neutral"
+        stateCol = oversold ? color.new(color.lime, 0) : overbought ? color.new(color.red, 0) : color.new(color.silver, 0)
+        table.cell(g, 1, 1, stateTxt, text_color=color.black, bgcolor=color.new(stateCol, 70))
+        table.cell(g, 0, 2, "Filters", text_color=color.black, bgcolor=color.new(color.white, 0))
+        flTxt = passTrendLong ? "EMA/VWAP OK (Long)" : passTrendShort ? "EMA/VWAP OK (Short)" : "Wait"
+        flCol = passTrendLong ? color.new(color.lime, 0) : passTrendShort ? color.new(color.red, 0) : color.new(color.silver, 0)
+        table.cell(g, 1, 2, flTxt, text_color=color.black, bgcolor=color.new(flCol, 70))
+        table.cell(g, 0, 3, "Regime", text_color=color.black, bgcolor=color.new(color.white, 0))
+        table.cell(g, 1, 3, regime == 1 ? "Bull" : regime == -1 ? "Bear" : "Flat", text_color=color.black, bgcolor=color.new(color.silver, 70))
+
+//━━━━━━━━━━━━━━━━━━ Condition Dots (optional debug) ━━━━━━━━━━━━━━━━━━
+plotshape(showDots and oversoldAny,    title="OS",      style=shape.circle,     location=location.belowbar, color=color.new(color.lime,  60), size=size.tiny)
+plotshape(showDots and overboughtAny,  title="OB",      style=shape.circle,     location=location.abovebar, color=color.new(color.red,   60), size=size.tiny)
+plotshape(showDots and passTrendLong,  title="Bias L",  style=shape.circle,     location=location.belowbar, color=color.new(color.teal,  60), size=size.tiny)
+plotshape(showDots and passTrendShort, title="Bias S",  style=shape.circle,     location=location.abovebar, color=color.new(color.orange,60), size=size.tiny)
+plotshape(showDots and turnUp,         title="Turn Up", style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(showDots and turnDown,       title="Turn Dn", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,   0), size=size.tiny)
