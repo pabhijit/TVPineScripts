@@ -75,6 +75,30 @@ plot(val_pdc, "PDC (Prev Close)", cPDC, 1)
 plot(val_onh, "ONH (Overnight High)", cONH, 1)
 plot(val_onl, "ONL (Overnight Low)" , cONL, 1)
 
+// ===== VWAP =====
+grpVWAP      = "VWAP"
+showVWAP     = input.bool(true, "Show VWAP", group=grpVWAP)
+showVWAPBand = input.bool(false, "Show VWAP ±σ Bands", group=grpVWAP)
+bandMult     = input.float(1.0, "StdDev Multiplier", minval=0.1, step=0.1, group=grpVWAP)
+
+vwapLine  = ta.vwap
+src       = hlc3
+sd        = ta.stdev(src, 20)  // rolling stdev, you can change length
+vwapUpper = vwapLine + bandMult * sd
+vwapLower = vwapLine - bandMult * sd
+
+val_vwap  = showVWAP ? vwapLine : na
+val_vwup  = showVWAPBand ? vwapUpper : na
+val_vwlo  = showVWAPBand ? vwapLower : na
+
+cVWAP = color.new(color.blue, 0)
+cVWUP = color.new(color.blue, 50)
+cVWLO = color.new(color.blue, 50)
+
+plot(val_vwap, "VWAP", cVWAP, 2)
+plot(val_vwup, "VWAP Upper", cVWUP, 1)
+plot(val_vwlo, "VWAP Lower", cVWLO, 1)
+
 // ===== ORB sessions pinned to NY time
 inORBrange = not na(time(timeframe.period, ORBrange,  NY_TZ))
 inExtend   = not na(time(timeframe.period, ORBextend, NY_TZ))
@@ -204,6 +228,54 @@ val_friL = showFridayHL ? (showTodayOnly ? (isToday ? friL_prev : na) : friL_pre
 plot(val_friH, "Friday High (Prev Week)", cFri, 1)
 plot(val_friL, "Friday Low (Prev Week)" , cFri, 1)
 
+// ===== 9/21 EMA Cloud (true candle-hug) + signals =====
+grpEMA        = "EMA Cross (9/21)"
+showEMAs      = input.bool(true,  "Show 9 & 21 EMAs", group=grpEMA)
+lenFast       = input.int(9,      "Fast EMA", minval=1, group=grpEMA)
+lenSlow       = input.int(21,     "Slow EMA", minval=1, group=grpEMA)
+showSignals   = input.bool(true,  "Show Long/Short Signals", group=grpEMA)
+showEMACloud  = input.bool(true,  "Show EMA Cloud", group=grpEMA)
+cloudBullCol  = input.color(color.lime, "Bull Cloud Color", group=grpEMA)
+cloudBearCol  = input.color(color.red,  "Bear Cloud Color",  group=grpEMA)
+cloudTrans    = input.int(80, "Cloud Transparency (0–100)", minval=0, maxval=100, group=grpEMA)
+maTrans       = input.int(60, "MA Line Transparency (0–100)", minval=0, maxval=100, group=grpEMA)
+// If you use Heikin-Ashi and want the cloud to hug *actual* candles, turn this on:
+useTrueOHLC   = input.bool(false, "Force real OHLC (for HA charts)", group=grpEMA)
+
+// --- choose price source (fixes HA offset if enabled)
+srcH = useTrueOHLC ? request.security(syminfo.tickerid, timeframe.period, high,  lookahead=barmerge.lookahead_on) : high
+srcL = useTrueOHLC ? request.security(syminfo.tickerid, timeframe.period, low,   lookahead=barmerge.lookahead_on) : low
+srcC = useTrueOHLC ? request.security(syminfo.tickerid, timeframe.period, close, lookahead=barmerge.lookahead_on) : close
+
+// Core EMAs for trend & signals (close-based)
+emaFastC = ta.ema(srcC, lenFast)
+emaSlowC = ta.ema(srcC, lenSlow)
+
+// Hugging envelope = EMAs of HIGH/LOW at the fast length
+envTop = ta.ema(srcH, lenFast)
+envBot = ta.ema(srcL, lenFast)
+
+// Transparent guide lines (optional)
+colFast = color.new(color.green, maTrans)
+colSlow = color.new(color.red,   maTrans)
+plot(showEMAs ? emaFastC : na, title="EMA Fast", color=colFast, linewidth=2)
+plot(showEMAs ? emaSlowC : na, title="EMA Slow", color=colSlow, linewidth=2)
+
+// Cloud colored by 9/21 trend
+// Cloud boundary plots (hidden, valid linewidth)
+pTop = plot(showEMACloud ? envTop : na, title="EMA Cloud Top", color=color.new(color.gray, 100), linewidth=1, display=display.none)
+pBot = plot(showEMACloud ? envBot : na, title="EMA Cloud Bot", color=color.new(color.gray, 100), linewidth=1, display=display.none)
+fill(pTop, pBot, color = showEMACloud ? (emaFastC >= emaSlowC ? color.new(cloudBullCol, cloudTrans) : color.new(cloudBearCol, cloudTrans)) : na)
+
+// Signals from 9/21 cross
+longSig  = showSignals and ta.crossover(emaFastC, emaSlowC)
+shortSig = showSignals and ta.crossunder(emaFastC, emaSlowC)
+
+// Arrows just outside the cloud
+padTicks = syminfo.mintick * 6.0
+plotshape(longSig  ? (envBot - padTicks) : na, title="Long Signal (EMA Bull Cross)", style=shape.triangleup,   location=location.absolute, color=color.new(color.lime, 0), size=size.tiny, text="Long")
+plotshape(shortSig ? (envTop + padTicks) : na, title="Short Signal (EMA Bear Cross)", style=shape.triangledown, location=location.absolute, color=color.new(color.red,  0), size=size.tiny, text="Short")
+
 // ===== Right-edge labels
 var label lPDO = na
 var label lPDH = na
@@ -215,6 +287,7 @@ var label lEMu = na
 var label lEMl = na
 var label lFriH = na
 var label lFriL = na
+var label lVWAP = na
 
 if barstate.islast and showRightLabels
     if not na(lPDO)  
@@ -237,6 +310,8 @@ if barstate.islast and showRightLabels
         label.delete(lFriH)
     if not na(lFriL) 
         label.delete(lFriL)
+    if not na(lVWAP) 
+        label.delete(lVWAP)
     if not na(val_pdo)  
         lPDO  := label.new(bar_index + rightOffsetBars, val_pdo, "PDO",  xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cPDO, size=size.tiny)
     if not na(val_pdh)  
@@ -257,12 +332,14 @@ if barstate.islast and showRightLabels
         lFriH := label.new(bar_index + rightOffsetBars, val_friH,"FriH", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cFri, size=size.tiny)
     if not na(val_friL) 
         lFriL := label.new(bar_index + rightOffsetBars, val_friL,"FriL", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cFri, size=size.tiny)
+    if not na(val_vwap)
+        lVWAP := label.new(bar_index + rightOffsetBars, val_vwap, "VWAP", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=cVWAP, size=size.tiny)
 
 // ===== Legend (2 cols × 10 rows)
 var table t = na
 if showLegendTbl
     if na(t)
-        t := table.new(position.top_right, 2, 10)
+        t := table.new(position.top_right, 2, 11)
     if barstate.islast
         table.cell(t, 0, 0, "PDO", text_color=color.black, bgcolor=cPDO)
         table.cell(t, 1, 0, na(val_pdo) ? "" : str.tostring(val_pdo, format.mintick), text_color=color.black, bgcolor=color.new(cPDO, 60))
@@ -284,6 +361,9 @@ if showLegendTbl
         table.cell(t, 1, 8, na(val_friH) ? "" : str.tostring(val_friH, format.mintick), text_color=color.black, bgcolor=color.new(cFri, 60))
         table.cell(t, 0, 9, "FriL", text_color=color.black, bgcolor=cFri)
         table.cell(t, 1, 9, na(val_friL) ? "" : str.tostring(val_friL, format.mintick), text_color=color.black, bgcolor=color.new(cFri, 60))
+        table.cell(t, 0, 10, "VWAP", text_color=color.black, bgcolor=cVWAP)
+        table.cell(t, 1, 10, na(val_vwap) ? "" : str.tostring(val_vwap, format.mintick), text_color=color.black, bgcolor=color.new(cVWAP, 60))
+
 
 // ===== Alerts (unchanged from your base)
 havePDH = not na(val_pdh)
@@ -300,3 +380,6 @@ alertcondition(haveONL and ta.crossover(close, val_onl), "Cross Above ONL", "Pri
 alertcondition(haveONL and ta.crossunder(close, val_onl), "Cross Below ONL", "Price crossed BELOW Overnight Low (ONL)")
 alertcondition(orbReady and ta.crossover(close, orbHigh), "ORB Breakout Up", "Price broke ABOVE ORB High (today)")
 alertcondition(orbReady and ta.crossunder(close, orbLow), "ORB Breakdown",   "Price broke BELOW ORB Low (today)")
+alertcondition(longSig,  "EMA 9/21 Bull Cross", "Fast EMA crossed ABOVE Slow EMA (Long Signal)")
+alertcondition(shortSig, "EMA 9/21 Bear Cross", "Fast EMA crossed BELOW Slow EMA (Short Signal)")
+
